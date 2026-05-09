@@ -1,0 +1,8 @@
+*.db
+*.sqlite
+*.sqlite3
+
+.idea/
+.vscode/
+
+.DS_Store
