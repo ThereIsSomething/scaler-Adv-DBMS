@@ -217,11 +217,20 @@ std::string HeapEngine::ExecCreateTable(const CreateTableStmt& stmt) {
 }
 
 std::string HeapEngine::ExecInsert(const InsertStmt& stmt) {
+    if (tables_.find(stmt.table_name) == tables_.end()) {
+        return "Error: Table '" + stmt.table_name + "' does not exist.";
+    }
     Insert(stmt.table_name, stmt.values);
     return "Inserted 1 row.";
 }
 
 std::string HeapEngine::ExecSelect(const SelectStmt& stmt) {
+    if (tables_.find(stmt.table_name) == tables_.end()) {
+        return "Error: Table '" + stmt.table_name + "' does not exist.";
+    }
+    if (stmt.join.has_value() && tables_.find(stmt.join->table_name) == tables_.end()) {
+        return "Error: Join table '" + stmt.join->table_name + "' does not exist.";
+    }
     auto plan = CreateSelectPlan(stmt, this);
     plan->Open();
 
@@ -255,6 +264,9 @@ std::string HeapEngine::ExecSelect(const SelectStmt& stmt) {
 }
 
 std::string HeapEngine::ExecDelete(const DeleteStmt& stmt) {
+    if (tables_.find(stmt.table_name) == tables_.end()) {
+        return "Error: Table '" + stmt.table_name + "' does not exist.";
+    }
     const Schema& schema = GetSchema(stmt.table_name);
     HeapFile* heap = GetHeapFile(stmt.table_name);
     BPlusTree* index = GetIndex(stmt.table_name);
@@ -286,6 +298,9 @@ std::string HeapEngine::ExecDelete(const DeleteStmt& stmt) {
 }
 
 std::string HeapEngine::ExecUpdate(const UpdateStmt& stmt) {
+    if (tables_.find(stmt.table_name) == tables_.end()) {
+        return "Error: Table '" + stmt.table_name + "' does not exist.";
+    }
     const Schema& schema = GetSchema(stmt.table_name);
     HeapFile* heap = GetHeapFile(stmt.table_name);
     BPlusTree* index = GetIndex(stmt.table_name);

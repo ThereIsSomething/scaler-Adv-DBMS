@@ -11,6 +11,9 @@
 #include "parser/parser.h"
 #include "txn/lock_manager.h"
 #include "txn/txn_manager.h"
+#include "recovery/wal.h"
+#include "recovery/recovery.h"
+#include "lsm/lsm_engine.h"
 
 #include <iostream>
 #include <fstream>
@@ -274,6 +277,96 @@ static int RunTests() {
     }
 
     std::cout << "\n========================================\n";
+    std::cout << "  DoraDB — Milestone 5 Tests\n";
+    std::cout << "  LSM Engine + WAL Recovery\n";
+    std::cout << "========================================\n";
+
+    // --- Test: LSM Engine ---
+    std::cout << "\n=== LSM Engine (MemTable & Compaction) ===\n";
+    std::filesystem::remove_all("test_lsm");
+    {
+        LSMEngine lsm("test_lsm");
+        Schema s; 
+        s.columns.push_back({"id", DataType::INT});
+        s.pk_index = 0;
+        lsm.CreateTable("users", s);
+
+        // Insert enough to force flush (assuming MEMTABLE_MAX_ENTRIES is small enough or we force it)
+        // We'll just insert 5 and use ForceFlush
+        for (int i = 1; i <= 5; i++) {
+            lsm.Insert("users", {Value::Int(i)});
+        }
+        
+        CHECK(lsm.GetMemTableSize("users") == 5, "MemTable has 5 entries");
+        
+        // Force flush to SSTable
+        lsm.FlushMemTable("users");
+        CHECK(lsm.GetMemTableSize("users") == 0, "MemTable empty after flush");
+        CHECK(lsm.GetSSTableCount("users") == 1, "1 SSTable created");
+
+        // Insert more and flush again
+        for (int i = 6; i <= 10; i++) {
+            lsm.Insert("users", {Value::Int(i)});
+        }
+        lsm.FlushMemTable("users");
+        CHECK(lsm.GetSSTableCount("users") == 2, "2 SSTables created");
+
+        // Scan should merge MemTable and all SSTables correctly
+        auto rows = lsm.Scan("users");
+        CHECK(rows.size() == 10, "Scan returns all 10 rows from multiple SSTables");
+
+        // Update a row and delete another
+        lsm.Update("users", 2, {Value::Int(200)}); // Update id 2
+        lsm.Remove("users", 8);              // Delete id 8
+
+        auto r2 = lsm.Get("users", 2);
+        CHECK(!r2.empty() && r2[0][0].int_val == 200, "Update applied correctly (tombstone/override)");
+        CHECK(lsm.Get("users", 8).empty(), "Delete applied correctly (tombstone)");
+
+        // Compact the SSTables
+        lsm.Compact("users");
+        CHECK(lsm.GetSSTableCount("users") == 1, "SSTables compacted into 1");
+        
+        // Scan again after compaction
+        rows = lsm.Scan("users");
+        CHECK(rows.size() == 9, "Scan returns 9 rows after compaction (1 deleted)");
+    }
+    std::filesystem::remove_all("test_lsm");
+
+    // --- Test: WAL and Recovery ---
+    std::cout << "\n=== WAL & ARIES Recovery ===\n";
+    std::filesystem::remove_all("test_wal");
+    std::filesystem::create_directories("test_wal");
+    {
+        WAL wal("test_wal/log.bin");
+        // Simulate T1 (Commits)
+        wal.AppendBegin(1);
+        wal.AppendInsert(1, "users", {10, 0}, "A", 1);
+        wal.AppendCommit(1);
+
+        // Simulate T2 (Active/Crashes)
+        wal.AppendBegin(2);
+        wal.AppendInsert(2, "users", {11, 0}, "B", 1);
+        
+        // Simulate T3 (Aborts)
+        wal.AppendBegin(3);
+        wal.AppendInsert(3, "users", {12, 0}, "C", 1);
+        wal.AppendAbort(3);
+    }
+    
+    // Recover
+    {
+        WAL wal("test_wal/log.bin");
+        std::unordered_map<std::string, RecoveryManager::TableAccess> dummy_tables;
+        // In a real recovery we pass actual heap pointers. Here we just test the analysis logic.
+        auto res = RecoveryManager::Recover(wal, dummy_tables);
+        
+        CHECK(res.committed_txns == 1, "Recovery found 1 committed txn (T1)");
+        CHECK(res.aborted_txns == 1, "Recovery found 1 txn to undo (T2 crashed)");
+    }
+    std::filesystem::remove_all("test_wal");
+
+    std::cout << "\n========================================\n";
     std::cout << "  Results: " << tests_passed << "/" << tests_total << " passed\n";
     std::cout << "========================================\n";
 
@@ -281,10 +374,61 @@ static int RunTests() {
 }
 
 // ============================================================
+// Benchmark: HeapEngine vs LSMEngine
+// ============================================================
+static void RunBenchmark() {
+    std::cout << "========================================\n";
+    std::cout << "  DoraDB Benchmark: HeapEngine vs LSM\n";
+    std::cout << "========================================\n";
+
+    const int NUM_OPS = 50000;
+    Schema schema;
+    schema.columns.push_back({"id", DataType::INT});
+    schema.pk_index = 0;
+
+    std::filesystem::remove_all("bench_heap");
+    std::filesystem::remove_all("bench_lsm");
+
+    // HeapEngine Benchmark
+    {
+        HeapEngine heap("bench_heap");
+        heap.CreateTable("data", schema);
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < NUM_OPS; i++) {
+            heap.Insert("data", {Value::Int(i)});
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        std::cout << "[HeapEngine] " << NUM_OPS << " Inserts: " << ms << " ms (" 
+                  << (NUM_OPS * 1000.0 / ms) << " ops/sec)\n";
+    }
+
+    // LSMEngine Benchmark
+    {
+        LSMEngine lsm("bench_lsm");
+        lsm.CreateTable("data", schema);
+        
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int i = 0; i < NUM_OPS; i++) {
+            lsm.Insert("data", {Value::Int(i)});
+        }
+        auto end = std::chrono::high_resolution_clock::now();
+        auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+        std::cout << "[LSMEngine]  " << NUM_OPS << " Inserts: " << ms << " ms (" 
+                  << (NUM_OPS * 1000.0 / ms) << " ops/sec)\n";
+    }
+
+    std::filesystem::remove_all("bench_heap");
+    std::filesystem::remove_all("bench_lsm");
+    std::cout << "========================================\n";
+}
+
+// ============================================================
 // REPL
 // ============================================================
 static void RunREPL() {
-    std::cout << "DoraDB v0.4 — A MiniDB Engine\n";
+    std::cout << "DoraDB v0.5 — A MiniDB Engine\n";
     std::cout << "Type SQL statements, \\i <file> to run script, \\q to quit.\n\n";
 
     HeapEngine engine("data");
@@ -323,8 +467,13 @@ static void RunREPL() {
 // Main
 // ============================================================
 int main(int argc, char* argv[]) {
-    if (argc > 1 && std::string(argv[1]) == "--test") {
-        return RunTests();
+    if (argc > 1) {
+        std::string arg = argv[1];
+        if (arg == "--test") return RunTests();
+        if (arg == "--bench") {
+            RunBenchmark();
+            return 0;
+        }
     }
     RunREPL();
     return 0;
